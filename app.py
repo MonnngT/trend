@@ -29,6 +29,8 @@ PERIOD_INTERVALS = {
     "5y": "1wk",
 }
 
+TROY_OUNCE_GRAMS = 31.1034768
+
 
 st.set_page_config(
     page_title="Gold Trend Monitor",
@@ -139,6 +141,17 @@ def load_stooq_daily(symbol: str, period: str) -> pd.DataFrame:
     data = data.set_index("Date")
     data = data[data.index >= stooq_cutoff(period)]
     return normalize_ohlcv(data)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_usdcny_rate() -> tuple[float | None, str, str]:
+    try:
+        data = load_yahoo_chart("CNY=X", "5d", "1d")
+        if not data.empty:
+            return float(data["Close"].iloc[-1]), "Yahoo Finance (CNY=X)", ""
+        return None, "No source", "Yahoo Finance returned 0 rows for CNY=X."
+    except Exception as exc:
+        return None, "No source", f"USD/CNY rate failed: {exc}"
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -333,21 +346,46 @@ K线间隔: {interval}
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
+        "max_tokens": 1500,
         "temperature": 0.2,
         "stream": False,
     }
     if thinking_enabled:
         kwargs["reasoning_effort"] = "high"
         kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+    else:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
 
     response = client.chat.completions.create(**kwargs)
-    return response.choices[0].message.content
+    if not response.choices:
+        raise RuntimeError("DeepSeek returned no choices.")
+
+    message = response.choices[0].message
+    content = message.content or ""
+    if not content.strip():
+        extra = getattr(message, "model_extra", {}) or {}
+        content = extra.get("reasoning_content", "") or extra.get("reasoning", "")
+    if not content.strip():
+        raise RuntimeError("DeepSeek returned an empty response. Try deepseek-v4-pro with Thinking mode off.")
+    return content
 
 
 def format_number(value: float, digits: int = 2) -> str:
     if pd.isna(value):
         return "-"
     return f"{value:,.{digits}f}"
+
+
+def converted_price_text(symbol_name: str, price_usd: float, usdcny: float | None) -> tuple[str, str]:
+    if not usdcny:
+        return "-", "USD/CNY unavailable"
+
+    cny_price = price_usd * usdcny
+    if symbol_name == "SPDR Gold Shares ETF":
+        return f"¥{cny_price:,.2f}", "CNY/share"
+
+    cny_per_gram = cny_price / TROY_OUNCE_GRAMS
+    return f"¥{cny_per_gram:,.2f}", "CNY/g"
 
 
 def main() -> None:
@@ -370,7 +408,7 @@ def main() -> None:
         st.header("DeepSeek AI")
         ai_enabled = st.toggle("Enable AI analysis", value=False)
         model = st.selectbox("Model", ["deepseek-v4-pro", "deepseek-v4-flash"], index=0)
-        thinking_enabled = st.toggle("Thinking mode", value=True)
+        thinking_enabled = st.toggle("Thinking mode", value=False)
 
     if auto_refresh:
         st_autorefresh(interval=refresh_seconds * 1000, key="gold_market_refresh")
@@ -388,17 +426,24 @@ def main() -> None:
 
     df = add_indicators(data)
     snapshot = latest_snapshot(df)
+    usdcny_rate, usdcny_source, usdcny_error = load_usdcny_rate()
+    cny_text, cny_unit = converted_price_text(symbol_name, snapshot["price"], usdcny_rate)
     st.caption(f"Data source: {data_source}")
     if data_errors:
         with st.expander("Fallback details", expanded=False):
             st.code(data_errors, language="text")
 
-    metric_cols = st.columns(5)
-    metric_cols[0].metric("Last", format_number(snapshot["price"]), f'{snapshot["change"]:+.2f} ({snapshot["change_pct"]:+.2f}%)')
-    metric_cols[1].metric("Trend", snapshot["trend"])
-    metric_cols[2].metric("RSI14", format_number(snapshot["rsi14"]))
-    metric_cols[3].metric("ATR14", format_number(snapshot["atr14"]))
-    metric_cols[4].metric("Updated", pd.Timestamp(snapshot["time"]).strftime("%Y-%m-%d %H:%M"))
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("USD price", format_number(snapshot["price"]), f'{snapshot["change"]:+.2f} ({snapshot["change_pct"]:+.2f}%)')
+    metric_cols[1].metric(cny_unit, cny_text)
+    metric_cols[2].metric("USD/CNY", format_number(usdcny_rate, 4) if usdcny_rate else "-")
+    metric_cols[3].metric("Trend", snapshot["trend"])
+    metric_cols[4].metric("RSI14", format_number(snapshot["rsi14"]))
+    metric_cols[5].metric("Updated", pd.Timestamp(snapshot["time"]).strftime("%Y-%m-%d %H:%M"))
+    if usdcny_rate:
+        st.caption(f"FX source: {usdcny_source}. CNY/g uses 1 troy ounce = {TROY_OUNCE_GRAMS:.4f} g.")
+    elif usdcny_error:
+        st.warning(usdcny_error)
 
     st.plotly_chart(build_chart(df, symbol_name), use_container_width=True)
 
@@ -412,21 +457,35 @@ def main() -> None:
         elif st.button("Run DeepSeek AI analysis", type="primary", use_container_width=True):
             with st.spinner("DeepSeek is analyzing the latest gold data..."):
                 try:
+                    analysis_snapshot = {
+                        **snapshot,
+                        "usd_cny": usdcny_rate,
+                        "cny_price": cny_text,
+                        "cny_unit": cny_unit,
+                        "data_source": data_source,
+                    }
                     analysis = run_deepseek_analysis(
                         api_key=api_key,
                         model=model,
                         symbol_name=symbol_name,
                         period=period,
                         interval=interval,
-                        snapshot=snapshot,
+                        snapshot=analysis_snapshot,
                         market_csv=compact_market_table(df),
                         thinking_enabled=thinking_enabled,
                     )
                 except Exception as exc:
-                    st.error(f"DeepSeek analysis failed: {exc}")
+                    st.session_state["last_ai_error"] = str(exc)
+                    st.session_state.pop("last_ai_analysis", None)
                 else:
-                    st.subheader("AI analysis")
-                    st.write(analysis)
+                    st.session_state["last_ai_analysis"] = analysis
+                    st.session_state.pop("last_ai_error", None)
+
+        if st.session_state.get("last_ai_error"):
+            st.error(f"DeepSeek analysis failed: {st.session_state['last_ai_error']}")
+        if st.session_state.get("last_ai_analysis"):
+            st.subheader("AI analysis")
+            st.write(st.session_state["last_ai_analysis"])
 
     st.caption(
         "Market data may be delayed and can contain gaps. This tool is for research only and is not financial advice."

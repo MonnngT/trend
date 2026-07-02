@@ -6,6 +6,7 @@
 - K 线图、SMA、布林带、RSI、MACD、ATR 技术指标
 - 自动刷新和手动刷新
 - 可选 DeepSeek AI 分析按钮，基于最新行情输出趋势和交易计划
+- Yahoo Finance chart 数据源，失败时自动切换到 Stooq 日线备用源
 
 > 本项目仅用于行情研究和学习，不构成投资建议。
 
@@ -41,4 +42,4 @@ DEEPSEEK_API_KEY = "your_deepseek_api_key"
 
 ## 说明
 
-行情数据来自 Yahoo Finance，分钟级数据可能延迟或缺失。交易前请核对券商、交易所和宏观事件数据。
+行情数据优先来自 Yahoo Finance chart API，失败时自动使用 Stooq 日线备用源。分钟级数据可能延迟或缺失。交易前请核对券商、交易所和宏观事件数据。

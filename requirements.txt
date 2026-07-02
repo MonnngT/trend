@@ -2,6 +2,6 @@ numpy>=1.26
 openai>=1.40
 pandas>=2.2
 plotly>=5.22
+requests>=2.32
 streamlit>=1.36
 streamlit-autorefresh>=1.0.1
-yfinance>=0.2.40

@@ -1,20 +1,21 @@
+import io
 import os
-from datetime import datetime
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-import yfinance as yf
 from openai import OpenAI
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
 
 SYMBOLS = {
-    "XAU/USD spot": "XAUUSD=X",
-    "COMEX gold futures": "GC=F",
-    "SPDR Gold Shares ETF": "GLD",
+    "COMEX gold futures": {"yahoo": "GC=F", "stooq": "gc.f"},
+    "XAU/USD spot": {"yahoo": "XAUUSD=X", "stooq": "xauusd"},
+    "SPDR Gold Shares ETF": {"yahoo": "GLD", "stooq": "gld.us"},
 }
 
 PERIOD_INTERVALS = {
@@ -31,7 +32,7 @@ PERIOD_INTERVALS = {
 
 st.set_page_config(
     page_title="Gold Trend Monitor",
-    page_icon="🟡",
+    page_icon="G",
     layout="wide",
 )
 
@@ -46,25 +47,122 @@ def get_secret(name: str) -> str | None:
         return None
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def load_market_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    data = yf.download(
-        tickers=symbol,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+def normalize_ohlcv(data: pd.DataFrame) -> pd.DataFrame:
+    required = ["Open", "High", "Low", "Close"]
+    for column in required:
+        if column not in data.columns:
+            raise ValueError(f"Missing {column} column")
+
+    if "Volume" not in data.columns:
+        data["Volume"] = 0
+
+    data = data[["Open", "High", "Low", "Close", "Volume"]].copy()
+    for column in data.columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+    return data.dropna(subset=["Close"]).sort_index()
+
+
+def load_yahoo_chart(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol, safe='')}"
+    response = requests.get(
+        url,
+        params={"range": period, "interval": interval, "includePrePost": "false"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
     )
+    response.raise_for_status()
+    chart = response.json().get("chart", {})
+    if chart.get("error"):
+        raise RuntimeError(chart["error"])
+
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError("Yahoo returned no chart result")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quotes = (result.get("indicators", {}).get("quote") or [{}])[0]
+    if not timestamps or not quotes:
+        raise RuntimeError("Yahoo returned no price rows")
+
+    index = pd.to_datetime(timestamps, unit="s", utc=True)
+    timezone = result.get("meta", {}).get("exchangeTimezoneName")
+    if timezone:
+        try:
+            index = index.tz_convert(timezone)
+        except Exception:
+            pass
+    index = index.tz_localize(None)
+
+    data = pd.DataFrame(
+        {
+            "Open": quotes.get("open"),
+            "High": quotes.get("high"),
+            "Low": quotes.get("low"),
+            "Close": quotes.get("close"),
+            "Volume": quotes.get("volume"),
+        },
+        index=index,
+    )
+    return normalize_ohlcv(data)
+
+
+def stooq_cutoff(period: str) -> pd.Timestamp:
+    days = {
+        "1d": 60,
+        "5d": 90,
+        "1mo": 180,
+        "3mo": 240,
+        "6mo": 365,
+        "1y": 540,
+        "2y": 900,
+        "5y": 2000,
+    }.get(period, 365)
+    return pd.Timestamp.today().normalize() - pd.Timedelta(days=days)
+
+
+def load_stooq_daily(symbol: str, period: str) -> pd.DataFrame:
+    response = requests.get(
+        "https://stooq.com/q/d/l/",
+        params={"s": symbol, "i": "d"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    if not response.text.strip() or "No data" in response.text[:80]:
+        raise RuntimeError("Stooq returned no data")
+
+    data = pd.read_csv(io.StringIO(response.text))
     if data.empty:
-        return data
+        raise RuntimeError("Stooq returned an empty CSV")
+    data["Date"] = pd.to_datetime(data["Date"])
+    data = data.set_index("Date")
+    data = data[data.index >= stooq_cutoff(period)]
+    return normalize_ohlcv(data)
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
 
-    data = data.rename(columns=str.title)
-    data = data.dropna(subset=["Close"])
-    return data
+@st.cache_data(ttl=60, show_spinner=False)
+def load_market_data(symbol_name: str, period: str, interval: str) -> tuple[pd.DataFrame, str, str]:
+    config = SYMBOLS[symbol_name]
+    errors: list[str] = []
+
+    try:
+        data = load_yahoo_chart(config["yahoo"], period, interval)
+        if not data.empty:
+            return data, f"Yahoo Finance ({config['yahoo']})", ""
+        errors.append("Yahoo Finance returned 0 rows.")
+    except Exception as exc:
+        errors.append(f"Yahoo Finance failed: {exc}")
+
+    try:
+        data = load_stooq_daily(config["stooq"], period)
+        if not data.empty:
+            return data, f"Stooq daily fallback ({config['stooq']})", "\n".join(errors)
+        errors.append("Stooq returned 0 rows.")
+    except Exception as exc:
+        errors.append(f"Stooq fallback failed: {exc}")
+
+    return pd.DataFrame(), "No source", "\n".join(errors)
 
 
 def rsi(series: pd.Series, window: int = 14) -> pd.Series:
@@ -277,13 +375,23 @@ def main() -> None:
     if auto_refresh:
         st_autorefresh(interval=refresh_seconds * 1000, key="gold_market_refresh")
 
-    data = load_market_data(SYMBOLS[symbol_name], period, interval)
+    data, data_source, data_errors = load_market_data(symbol_name, period, interval)
     if data.empty:
         st.error("No market data returned. Try another symbol, period, or interval.")
+        if data_errors:
+            st.code(data_errors, language="text")
+        st.info(
+            "If this keeps happening, your network may be blocking the market data provider. "
+            "COMEX gold futures and GLD usually have the best availability."
+        )
         return
 
     df = add_indicators(data)
     snapshot = latest_snapshot(df)
+    st.caption(f"Data source: {data_source}")
+    if data_errors:
+        with st.expander("Fallback details", expanded=False):
+            st.code(data_errors, language="text")
 
     metric_cols = st.columns(5)
     metric_cols[0].metric("Last", format_number(snapshot["price"]), f'{snapshot["change"]:+.2f} ({snapshot["change_pct"]:+.2f}%)')
